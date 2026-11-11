@@ -18,7 +18,14 @@ function cleanSupabaseUrl(raw: string): string {
  */
 export function getSupabase(): SupabaseClient {
   if (!client) {
-    client = createClient(cleanSupabaseUrl(requireEnv("SUPABASE_URL")), requireEnv("SUPABASE_SECRET_KEY"), {
+    const secretKey = requireEnv("SUPABASE_SECRET_KEY");
+    if (secretKey.startsWith("sb_publishable_")) {
+      throw new Error(
+        "SUPABASE_SECRET_KEY is a publishable key. Set it to the Supabase secret key (sb_secret_...) or legacy service_role key in the server environment."
+      );
+    }
+
+    client = createClient(cleanSupabaseUrl(requireEnv("SUPABASE_URL")), secretKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
   }
