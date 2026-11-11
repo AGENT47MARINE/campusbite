@@ -27,6 +27,17 @@ const getMenu = defineTool({
 
     const { data, error } = await query;
     if (error) throw new Error(error.message);
+    if (data.length === 0) {
+      const { count, error: countError } = await getSupabase()
+        .from("menu_items")
+        .select("id", { count: "exact", head: true });
+      if (countError) throw new Error(countError.message);
+      if (count === 0) {
+        throw new Error(
+          "The menu database has no items yet. The operator must run seed/menu-items.sql in the Supabase SQL Editor."
+        );
+      }
+    }
     return data;
   },
 });

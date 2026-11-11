@@ -15,6 +15,15 @@ export async function GET() {
       console.error("[GET /api/menu]", error.message);
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
+    if (data.length === 0) {
+      return NextResponse.json(
+        {
+          error: "The menu database has no items yet. Run seed/menu-items.sql in the Supabase SQL Editor.",
+          setup_required: true,
+        },
+        { status: 503 }
+      );
+    }
     return NextResponse.json({ items: data });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Could not load menu";

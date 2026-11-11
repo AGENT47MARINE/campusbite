@@ -25,12 +25,16 @@ export async function GET() {
 
   let databaseCheck = "skipped (Supabase settings missing)";
   if (settings.SUPABASE_URL && settings.SUPABASE_SECRET_KEY) {
-    const { error } = await getSupabase().from("menu_items").select("id").limit(1);
+    const { count, error } = await getSupabase()
+      .from("menu_items")
+      .select("id", { count: "exact", head: true });
     if (error) {
       console.error("[GET /api/health]", error.message);
       databaseCheck = `failed: ${error.message}`;
+    } else if (count === 0) {
+      databaseCheck = "failed: menu_items table is empty (run seed/menu-items.sql)";
     } else {
-      databaseCheck = "ok (menu_items table found)";
+      databaseCheck = `ok (${count} menu items found)`;
     }
   }
 
