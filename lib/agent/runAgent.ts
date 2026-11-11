@@ -1,7 +1,8 @@
 import "server-only";
-import type { Content, Part } from "@google/genai";
+import type { Content, FunctionDeclaration, Part } from "@google/genai";
 import { getGemini } from "../gemini";
-import { GEMINI_MODEL } from "../env";
+import { FALLBACK_MODEL, GEMINI_MODEL } from "../env";
+import { ThinkingLevel } from "@google/genai";
 import type { ChatMessage } from "../schemas";
 import { tools } from "./tools";
 import { toFunctionDeclarations } from "./defineTool";
@@ -10,6 +11,18 @@ import type { AgentResult, AgentStep } from "./types";
 
 /** Stops the agent from looping forever and using up your Gemini quota. */
 const MAX_ROUNDS = 8;
+
+/** Total time budget. Must stay below maxDuration in app/api/agent/route.ts. */
+const TIME_BUDGET_MS = 45_000;
+
+/**
+ * Thinking makes Gemini slow (4+ seconds per round), which caused 504 timeouts on Vercel.
+ * Ordering is simple, so keep thinking minimal.
+ */
+function thinkingConfig(model: string) {
+  if (/gemini-2\.5/.test(model)) return { thinkingBudget: 0 };
+  return { thinkingLevel: ThinkingLevel.LOW };
+}
 
 /**
  * THE AGENT LOOP
@@ -28,16 +41,10 @@ export async function runAgent(messages: ChatMessage[]): Promise<AgentResult> {
     parts: [{ text: m.text }],
   }));
 
+  const startedAt = Date.now();
   for (let round = 0; round < MAX_ROUNDS; round++) {
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents,
-      config: {
-        systemInstruction: buildSystemPrompt(),
-        tools: [{ functionDeclarations }],
-        temperature: 0.2,
-      },
-    });
+    if (Date.now() - startedAt > TIME_BUDGET_MS) break;
+    const response = await generate(ai, contents, functionDeclarations);
 
     const calls = response.functionCalls ?? [];
 
@@ -50,25 +57,57 @@ export async function runAgent(messages: ChatMessage[]): Promise<AgentResult> {
     const modelTurn = response.candidates?.[0]?.content;
     if (modelTurn) contents.push(modelTurn);
 
-    const responseParts: Part[] = [];
-    for (const call of calls) {
-      const step = await runTool(call.name ?? "", call.args ?? {});
+    // Run read-only tools in parallel; writes run one by one, in order.
+    const results: AgentStep[] = [];
+    if (calls.every((c) => !tools.find((t) => t.name === c.name)?.writes)) {
+      results.push(...(await Promise.all(calls.map((c) => runTool(c.name ?? "", c.args ?? {})))));
+    } else {
+      for (const c of calls) results.push(await runTool(c.name ?? "", c.args ?? {}));
+    }
+    const responseParts: Part[] = calls.map((call, i) => {
+      const step = results[i];
       steps.push(step);
-      responseParts.push({
+      return {
         functionResponse: {
           id: call.id,
           name: call.name,
           response: step.ok ? { result: step.result } : { error: step.error },
         },
-      });
-    }
+      };
+    });
     contents.push({ role: "user", parts: responseParts });
   }
 
   return {
-    reply: "I needed too many steps for this request. Please try a simpler or more specific question.",
+    reply: "That took too long. Please try again with a simpler or more specific request.",
     steps,
   };
+}
+
+/** Retries once on busy/slow Gemini errors, using a fallback model on the second try. */
+async function generate(ai: ReturnType<typeof getGemini>, contents: Content[], functionDeclarations: FunctionDeclaration[]) {
+  const models = [GEMINI_MODEL, FALLBACK_MODEL];
+  for (let attempt = 0; ; attempt++) {
+    const model = models[attempt];
+    try {
+      return await ai.models.generateContent({
+        model,
+        contents,
+        config: {
+          systemInstruction: buildSystemPrompt(),
+          tools: [{ functionDeclarations }],
+          temperature: 0.2,
+          thinkingConfig: thinkingConfig(model),
+          httpOptions: { timeout: 20_000 },
+        },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "";
+      const transient = /429|500|503|504|DEADLINE|UNAVAILABLE|timed? ?out|abort|fetch failed/i.test(message);
+      if (!transient || attempt >= models.length - 1) throw err;
+      console.warn(`[agent] ${model} failed, retrying with ${models[attempt + 1]}:`, message.slice(0, 120));
+    }
+  }
 }
 
 async function runTool(name: string, rawArgs: unknown): Promise<AgentStep> {
